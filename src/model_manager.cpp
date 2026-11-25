@@ -10,6 +10,7 @@
 #include <unordered_set>
 
 #include "core/backend_fit.h"
+#include "core/device_health.h"
 #include "core/ggml_extend_backend.h"
 #include "core/last_error.h"
 #include "core/util.h"
@@ -2145,6 +2146,9 @@ ModelManager::RAMBudget ModelManager::available_ram_for_fit() const {
     constexpr size_t reserve = 1024ULL * 1024 * 1024;
     size_t available         = free < 0 ? 0 : size_t(std::max<int64_t>(free - reserve, 0));
     available += std::min(reclaimable, SIZE_MAX - available);
+    const double share = sd::device_health().ram_share();
+    if (share < 1.0)
+        available = static_cast<size_t>(static_cast<double>(available) * share);
     const auto weights = max_ram_bytes_ ? std::min(available, max_ram_bytes_ > fixed ? max_ram_bytes_ - fixed : 0) : available;
     return {weights, available};
 }
@@ -2637,6 +2641,7 @@ void ModelManager::memory_guard_unreachable(const DeviceMemoryRequest& request,
     if (memory_watchdog_.should_log_unreachable(request.compute_backend)) {
         LOG_WARN("memory guard: cannot reduce %s below %d%% usage, continuing under pressure",
                  ggml_backend_name(request.compute_backend), memory_watchdog_.threshold_percent());
+        sd::note_memory_guard_unreachable(request.compute_backend, memory_watchdog_.threshold_percent());
     }
 }
 
@@ -2799,7 +2804,8 @@ bool ModelManager::ensure_compute_backend_capacity(
     const DeviceMemoryRequest& request,
     const std::vector<ggml_tensor*>& required_params,
     const std::vector<std::vector<ggml_tensor*>>& preferred_eviction_order,
-    const std::vector<ggml_tensor*>& protected_params) {
+    const std::vector<ggml_tensor*>& protected_params,
+    std::string* device_memory_error) {
     if (retain_weights_) {
         std::vector<TensorState*> states;
         if (!resolve_required_tensor_states(required_params, states, request.compute_backend))
@@ -2816,10 +2822,10 @@ bool ModelManager::ensure_compute_backend_capacity(
                 const DeviceMemoryRequest peer{backend, request.owner_id,
                                                pending > SIZE_MAX - missing ? SIZE_MAX : pending + missing,
                                                request.runtime_resident_bytes, limit};
-                if (!execution_engine()->ensure_capacity(*this, peer, {}, preferred_eviction_order, protected_weights))
+                if (!execution_engine()->ensure_capacity(*this, peer, {}, preferred_eviction_order, protected_weights, device_memory_error))
                     return false;
             }
         }
     }
-    return execution_engine()->ensure_capacity(*this, request, required_params, preferred_eviction_order, protected_params);
+    return execution_engine()->ensure_capacity(*this, request, required_params, preferred_eviction_order, protected_params, device_memory_error);
 }

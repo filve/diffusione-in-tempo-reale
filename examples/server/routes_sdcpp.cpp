@@ -13,6 +13,7 @@
 #include "async_jobs.h"
 #include "common/common.h"
 #include "common/resource_owners.hpp"
+#include "guardian.h"
 #include "model_catalog.h"
 
 namespace fs = std::filesystem;
@@ -358,6 +359,7 @@ static json make_capabilities_json(ServerRuntime& runtime) {
     };
     result["generation_features"]        = generation_features;
     result["generation_model_selection"] = true;
+    result["media_view"]                 = runtime.svr_params->media_view;
     result["runtime"]                    = model_status(runtime);
     result["current_mode"]               = current_mode;
     result["supported_modes"]            = supported_modes;
@@ -462,6 +464,9 @@ bool parse_native_job_request(const json& body, ServerRuntime& runtime, AsyncGen
 }
 
 static void submit_generation_job(ServerRuntime& runtime, const httplib::Request& req, httplib::Response& res, SDMode mode) {
+    if (refuse_while_halted(runtime.guardian, res)) {
+        return;
+    }
     try {
         if (req.body.empty()) {
             res.status = 400;
@@ -549,6 +554,55 @@ static void submit_generation_job(ServerRuntime& runtime, const httplib::Request
     }
 }
 
+static bool same_device_name(const std::string& a, const std::string& b) {
+    return a.size() == b.size() &&
+           std::equal(a.begin(), a.end(), b.begin(), [](unsigned char x, unsigned char y) { return std::tolower(x) == std::tolower(y); });
+}
+
+static void answer_report_error(httplib::Response& res, int status, const std::string& code, const std::string& message) {
+    res.status = status;
+    res.set_content(safe_json_dump(json({{"error", message}, {"code", code}})), "application/json");
+}
+
+// A watcher outside the server (a thermal monitor, a supervisor, an operator) reports how a device is doing. The
+// reports go through while the server is halted: a watcher must be able to withdraw its signal.
+static void report_pressure(ServerRuntime& runtime, const std::string& name, const httplib::Request& req, httplib::Response& res) {
+    const std::vector<sd_device_health_t> components = read_device_health();
+    const auto found                                 = std::find_if(components.begin(), components.end(), [&](const sd_device_health_t& component) {
+        return same_device_name(component.name, name);
+    });
+    if (found == components.end()) {
+        answer_report_error(res, 404, "unknown_device", "no device is named '" + name + "': GET /sdcpp/v1/health lists them");
+        return;
+    }
+    const json body = json::parse(req.body, nullptr, false);
+    PressureReport report;
+    std::string error = "the body is not valid JSON";
+    if (body.is_discarded() || !parse_pressure_report(body, found->strain_levels, report, error)) {
+        answer_report_error(res, 400, "invalid_report", error);
+        return;
+    }
+    const std::string device = found->name;
+    if (!sd_report_device_pressure(device.c_str(), report.source.c_str(), report.level, report.critical, report.reason.c_str(), report.duration_seconds)) {
+        answer_report_error(res, 409, "report_refused", "device health did not take the report: a device holds the signals of 8 sources at most");
+        return;
+    }
+
+    json out = {{"device", nullptr}, {"guardian", nullptr}};
+    if (runtime.guardian != nullptr) {
+        // The watcher stops the work in progress at once when this report halts the server.
+        runtime.guardian->check_now();
+        out["guardian"] = runtime.guardian->health_json()["guardian"];
+    }
+    for (const auto& component : read_device_health()) {
+        if (same_device_name(component.name, device)) {
+            out["device"] = device_health_json(component);
+        }
+    }
+    res.status = 200;
+    res.set_content(safe_json_dump(out), "application/json");
+}
+
 void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
     ServerRuntime* runtime = &rt;
     RuntimeRoutes routes(svr, rt);
@@ -571,7 +625,36 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 {"max", manager.max_pending_jobs},
             };
         }
-        res.status = body.value("status", std::string()) == "unavailable" ? 503 : 200;
+        if (runtime->guardian != nullptr) {
+            json guarded     = runtime->guardian->health_json();
+            body["guardian"] = std::move(guarded["guardian"]);
+            body["devices"]  = std::move(guarded["devices"]);
+            if (body["guardian"].value("halted", false)) {
+                body["status"] = "halted";
+                res.set_header("Retry-After", std::to_string(body["guardian"].value("retry_after_seconds", 10)));
+            }
+        }
+        const std::string status = body.value("status", std::string());
+        res.status               = status == "unavailable" || status == "halted" ? 503 : 200;
+        res.set_content(safe_json_dump(body), "application/json");
+    });
+
+    svr.Post(R"(/sdcpp/v1/devices/([^/]+)/pressure)", [runtime](const httplib::Request& req, httplib::Response& res) {
+        report_pressure(*runtime, req.matches[1], req, res);
+    });
+
+    // An operator says the machine was checked: the critical signals end, the excluded devices come back at the last
+    // level of strain, and the queued jobs run again if nothing else holds the halt.
+    svr.Post("/sdcpp/v1/guardian/resume", [runtime](const httplib::Request&, httplib::Response& res) {
+        json body = json::object();
+        if (runtime->guardian != nullptr) {
+            runtime->guardian->resume();
+            body = runtime->guardian->health_json();
+        } else {
+            sd_resume_device_health();
+        }
+        runtime->async_job_manager->cv.notify_all();
+        res.status = 200;
         res.set_content(safe_json_dump(body), "application/json");
     });
 
@@ -616,17 +699,13 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
     });
 
     routes.get(R"(/sdcpp/v1/jobs/([A-Za-z0-9_\-]+))", [runtime](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Cache-Control", "no-store");
         AsyncJobManager& manager = *runtime->async_job_manager;
         std::lock_guard<std::mutex> lock(manager.mutex);
         purge_expired_jobs(manager);
 
         std::string job_id = req.matches[1];
         auto it            = manager.jobs.find(job_id);
-        if (it != manager.jobs.end() && it->second->kind == AsyncJobKind::Dgl) {
-            res.status = 404;
-            res.set_content(R"({"error":"job not found"})", "application/json");
-            return;
-        }
         if (it == manager.jobs.end()) {
             if (manager.expired_jobs.find(job_id) != manager.expired_jobs.end()) {
                 res.status = 410;
@@ -650,6 +729,7 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
     // its read timeout of 5 seconds to be sure there is none. RuntimeRoutes would not add anything here: it leaves
     // the job routes alone.
     svr.Post(R"(/sdcpp/v1/jobs/([A-Za-z0-9_\-]+)/cancel)", [runtime](const httplib::Request& req, httplib::Response& res, const httplib::ContentReader& body) {
+        res.set_header("Cache-Control", "no-store");
         if (req.has_header("Content-Length") || req.has_header("Transfer-Encoding")) {
             body([](const char*, size_t) { return true; });
         }
@@ -681,11 +761,6 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         }
 
         auto& job = *it->second;
-        if (job.kind == AsyncJobKind::Dgl) {
-            res.status = 404;
-            res.set_content(R"({"error":"job not found"})", "application/json");
-            return;
-        }
         if (job.status == AsyncJobStatus::Queued) {
             if (!cancel_queued_job(manager, job)) {
                 res.status = 409;

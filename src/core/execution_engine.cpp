@@ -6,6 +6,7 @@
 #include <thread>
 #include <unordered_set>
 
+#include "core/device_health.h"
 #include "core/ggml_extend_backend.h"
 #include "core/ggml_tensor_utils.h"
 #include "core/last_error.h"
@@ -31,6 +32,7 @@ namespace sd {
         std::unordered_set<const ggml_tensor*> params_tensor_set_;
         ggml_status last_compute_status_ = GGML_STATUS_FAILED;
         Tensor<float> output_;
+        std::string device_memory_error_;
 
         using GraphCutPlan = ggml_graph_cut::Plan;
         ggml_tensor* canonical_param_tensor(ggml_tensor* tensor);
@@ -48,6 +50,9 @@ namespace sd {
         bool fits(const std::vector<DeviceMemoryRequest>& requests, const std::vector<ggml_tensor*>& params, bool allow_reclamation = false) const;
         bool execute_segment(ggml_cgraph* graph, int n_threads, const std::function<void()>& on_before_compute);
         bool execute_graph(ggml_cgraph* graph, int n_threads, bool no_return, const std::function<bool()>& read_outputs);
+        // The device of this run that device health excludes, if any: the main one, or one the layer split gave
+        // nodes to before it was excluded.
+        ggml_backend_t excluded_backend() const;
         bool is_multi_device() const { return !session_.extra_backends_.empty(); }
         size_t retained_runtime_buffer_bytes(ggml_backend_t backend) const { return session_.resident_bytes(backend); }
         void sync_runtime_residency() { engine_.sync_residency(session_); }
@@ -74,9 +79,9 @@ namespace sd {
 
         ComputeResult run() {
             if (!execute_graph(task_.graph, task_.n_threads, task_.no_return, task_.read_outputs)) {
-                return {last_compute_status_, {}};
+                return {last_compute_status_, {}, std::move(device_memory_error_)};
             }
-            return {GGML_STATUS_SUCCESS, std::move(output_)};
+            return {GGML_STATUS_SUCCESS, std::move(output_), {}};
         }
     };
 
@@ -453,7 +458,26 @@ namespace sd {
         return true;
     }
 
+    ggml_backend_t GraphExecution::excluded_backend() const {
+        auto& health = sd::device_health();
+        if (health.excluded(session_.backend_)) {
+            return session_.backend_;
+        }
+        for (ggml_backend_t backend : session_.extra_backends_) {
+            if (!health.excluded(backend)) {
+                continue;
+            }
+            for (const auto& entry : session_.node_assignments_) {
+                if (entry.second == backend) {
+                    return backend;
+                }
+            }
+        }
+        return nullptr;
+    }
+
     bool GraphExecution::execute_segment(ggml_cgraph* graph, int n_threads, const std::function<void()>& on_before_compute) {
+        n_threads = sd::device_health().cpu_threads(n_threads);
         if (sd_backend_is_cpu(session_.backend_)) {
             sd_backend_cpu_set_n_threads(session_.backend_, n_threads);
         }
@@ -489,6 +513,7 @@ namespace sd {
             last_compute_status_ = status;
             LOG_ERROR_CODE(status == GGML_STATUS_ALLOC_FAILED ? SD_ERROR_OUT_OF_MEMORY : SD_ERROR_BACKEND,
                            "%s compute failed: %s", task_.description.c_str(), ggml_status_to_string(status));
+            sd::note_compute_status(session_.backend_, status);
             return false;
         }
         const std::string description = task_.description;
@@ -606,10 +631,21 @@ namespace sd {
             const auto& segment = plan.segments[index];
             const bool last     = index + 1 == plan.segments.size();
             auto fail_segment   = [&](const char* phase) {
-                LOG_ERROR("%s segment %zu/%zu (%s) failed during %s", task_.description.c_str(),
-                          index + 1, plan.segments.size(), segment.group_name.c_str(), phase);
+                auto message = sd_format("%s segment %zu/%zu (%s) failed during %s", task_.description.c_str(),
+                                         index + 1, plan.segments.size(), segment.group_name.c_str(), phase);
+                LOG_ERROR("%s", message.c_str());
+                if (!device_memory_error_.empty()) {
+                    device_memory_error_ = message + ": " + device_memory_error_;
+                }
                 return false;
             };
+            // A device excluded while the graph runs is refused at the next segment; the line says why on its own.
+            if (ggml_backend_t excluded = excluded_backend()) {
+                last_compute_status_ = GGML_STATUS_FAILED;
+                LOG_ERROR_CODE(SD_ERROR_BACKEND, "%s: %s is excluded by device health; the engine does not compute on it",
+                               task_.description.c_str(), sd::layer_split_backend_device_display_name(excluded).c_str());
+                return false;
+            }
             session_.cut_cache_.prune(segment.live_cut_names);
             bindings.reset(segment);
             if (!bindings.bind_cached_inputs(segment, task_.description.c_str())) {
@@ -662,7 +698,7 @@ namespace sd {
                     sync_runtime_residency();
                     requests = memory_requests(measurement.buffers, new_cache_bytes);
                 }
-                const bool ready = weights.ensure_segment_capacity(index, requests);
+                const bool ready = weights.ensure_segment_capacity(index, requests, &device_memory_error_);
                 if (!ready && manager != nullptr) {
                     last_compute_status_ = GGML_STATUS_ALLOC_FAILED;
                 }
@@ -884,7 +920,8 @@ namespace sd {
         const DeviceMemoryRequest& request,
         const std::vector<ggml_tensor*>& required_params,
         const std::vector<std::vector<ggml_tensor*>>& preferred_eviction_order,
-        const std::vector<ggml_tensor*>& protected_params) {
+        const std::vector<ggml_tensor*>& protected_params,
+        std::string* device_memory_error) {
         GGML_ASSERT(&manager == manager_);
         auto capacity      = [&]() { return manager.inspect_compute_backend_capacity(request, required_params); };
         auto guard_ok      = [&]() { return manager.memory_guard_ok(request, required_params); };
@@ -982,10 +1019,14 @@ namespace sd {
         const auto budget_bytes = available.available_budget_bytes == SIZE_MAX
                                       ? std::string("unlimited")
                                       : sd_format("%.2f MB", available.available_budget_bytes / (1024.0 * 1024.0));
-        LOG_WARN("execution engine cannot make enough memory available on %s: need %.2f MB device / %.2f MB budget, available %s device / %s budget",
-                 ggml_backend_name(request.compute_backend),
-                 available.required_device_bytes / (1024.0 * 1024.0),
-                 available.required_budget_bytes / (1024.0 * 1024.0), device_bytes.c_str(), budget_bytes.c_str());
+        auto message            = sd_format("execution engine cannot make enough memory available on %s: need %.2f MB device / %.2f MB budget, available %s device / %s budget",
+                                            ggml_backend_name(request.compute_backend),
+                                            available.required_device_bytes / (1024.0 * 1024.0),
+                                            available.required_budget_bytes / (1024.0 * 1024.0), device_bytes.c_str(), budget_bytes.c_str());
+        LOG_WARN("%s", message.c_str());
+        if (device_memory_error != nullptr && available.valid) {
+            *device_memory_error = std::move(message);
+        }
         return false;
     }
 

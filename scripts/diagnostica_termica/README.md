@@ -11,9 +11,10 @@ frenando. Si usa a riposo, con il motore acceso, con una chat accanto, con tutto
 
 ## In breve
 
-- **Solo lettura.** `termico.py` non cambia nessuna impostazione della GPU, non avvia carichi, non ferma programmi.
-  Esegue `nvidia-smi` con interrogazioni di sola lettura e, se glielo chiedi, fa richieste `GET` al motore
-  (sezione [10](#10-cosa-fa-sul-tuo-pc-esattamente)).
+- **Solo lettura, salvo `--segnala`.** `termico.py` non cambia nessuna impostazione della GPU, non avvia carichi, non
+  ferma programmi. Esegue `nvidia-smi` con interrogazioni di sola lettura e, se glielo chiedi, fa richieste `GET` al
+  motore (sezione [10](#10-cosa-fa-sul-tuo-pc-esattamente)). Solo con `osserva --segnala` manda anche al motore la fascia
+  della GPU, e il motore le toglie lavoro (sezione [7.1](#71-segnalare-la-fascia-al-motore---segnala)).
 - **Non è un test di velocità né uno stress test.** Il carico lo generi tu, con il motore vero; lo strumento guarda
   cosa succede mentre lavora.
 - **Le fasce di temperatura sono indicative**, non garanzie del produttore: partono dai limiti che il driver dice
@@ -373,6 +374,47 @@ Una cautela: interrogare la GPU ogni secondo con `nvidia-smi` è leggero, ma su 
 può impedire alla GPU di spegnersi quando non serve. Non lasciare `osserva` acceso per ore a batteria se non ti
 serve.
 
+### 7.1 Segnalare la fascia al motore (`--segnala`)
+
+Con `--segnala` il programma non si limita a guardare: a ogni campione manda a `sd-server` la fascia della GPU come
+livello di salute del suo device, e il motore le toglie lavoro un gradino alla volta (85%, 70%, 55% di quello che può
+tenere, con i valori di partenza) e lo passa agli altri device; una GPU esclusa non calcola più niente finché non si
+riprende.
+
+```shell
+python scripts/diagnostica_termica/termico.py osserva --motore http://127.0.0.1:1234 --segnala
+```
+
+| Cosa vede `termico.py` | Livello mandato |
+|---|---|
+| fascia normale | nessuno (un segnale mandato prima si ritira) |
+| fascia normale, ma il driver rallenta la GPU per il caldo | 1 |
+| fascia di attenzione | 1 |
+| attenzione con throttling termico | 2 |
+| fascia critica | 3 |
+| critica con throttling termico hardware | escluso |
+
+- **Quale device.** Senza nome, il programma cerca la GPU fra i device del motore (`GET /sdcpp/v1/resources`) dal nome
+  che dà `nvidia-smi`; la stessa scheda vista da CUDA e da Vulkan va bene con l'uno o l'altro nome, perché il motore
+  riconosce la scheda e passa il segnale anche all'altro. Con due schede uguali, o se il nome non si trova, indica il
+  device: `--segnala CUDA0` (i nomi li elenca `GET /sdcpp/v1/health`, sotto `devices`).
+- **Un motore con altri livelli.** Il motore può avere più o meno di tre livelli di sforzo (`--device-health levels=N`):
+  il programma li legge da `GET /sdcpp/v1/health` e non va mai oltre l'ultimo, perché il livello dopo è l'esclusione.
+  Con due livelli la fascia critica vale 2, e lo dice all'inizio; l'esclusione arriva solo con il throttling hardware.
+- **Quanto dura.** Il segnale vale qualche campione (5 secondi con `--ogni 1`) e si ripete finché la fascia resta.
+  Tornata la GPU normale, e quando il programma si ferma, il segnale si ritira; il livello poi scende di un gradino
+  ogni 5 minuti di calma (con i valori di partenza), non di colpo. Se il programma cade, il segnale scade da solo
+  dopo pochi secondi.
+- **Cosa non fa.** Non ferma mai il motore da solo: manda al massimo "escluso", e il motore si ferma del tutto solo se
+  non gli resta nessun device su cui calcolare (sezione "Device health and the guardian" della
+  [guida dell'API](../../examples/server/api.md#device-health-and-the-guardian)).
+- **Errori.** Un motore che non risponde, la chiave API mancante o un device sconosciuto si dicono una volta sola, e
+  la misura va avanti; un motore lento non rallenta i campioni. La chiave è la stessa di `--motore` (`--chiave-api`
+  o `TERMICO_CHIAVE_API`).
+
+Le fasce restano indicative (sezione [6.4](#64-le-fasce-di-temperatura)): se sul tuo portatile il driver rallenta la GPU
+prima della fascia di attenzione, il programma lo segnala lo stesso con il livello 1.
+
 ## 8. Confrontare più prove (`confronta`)
 
 ```shell
@@ -549,8 +591,9 @@ nvidia-smi --query-gpu=temperature.gpu,power.draw,clocks.sm,utilization.gpu,memo
 ```
 
 (`-i 0` è la GPU scelta con `--gpu`.) Rete: **solo** se passi `--motore`, richieste `GET` a
-`<indirizzo>/sdcpp/v1/health` e `/sdcpp/v1/resources` dell'indirizzo che indichi, senza passare da proxy; niente
-altro, niente telemetria. File: scrive `.csv`, `.json`, `.txt` e l'eventuale file di stato soltanto nella cartella di
+`<indirizzo>/sdcpp/v1/health` e `/sdcpp/v1/resources` dell'indirizzo che indichi, senza passare da proxy; con
+`osserva --segnala` anche `POST <indirizzo>/sdcpp/v1/devices/{device}/pressure` a ogni campione (sezione
+[7.1](#71-segnalare-la-fascia-al-motore---segnala)); niente altro, niente telemetria. File: scrive `.csv`, `.json`, `.txt` e l'eventuale file di stato soltanto nella cartella di
 uscita (il nome della prova viene ripulito: non può far uscire i file dalla cartella). Non modifica né legge altro.
 
 `carico_motore.py` parla solo con il server che gli indichi: `POST /sdcpp/v1/img_gen`, `GET /sdcpp/v1/jobs/{id}` e
@@ -558,14 +601,16 @@ uscita (il nome della prova viene ripulito: non può far uscire i file dalla car
 
 ## 11. Cosa è verificato e cosa no
 
-**Verificato**, con 127 controlli automatici in [`test/termico_test.py`](../../test/termico_test.py) (circa 80
-secondi; una GPU finta che risponde come `nvidia-smi`, un motore finto, e il programma lanciato davvero): calcolo di
+**Verificato**, con 161 controlli automatici in [`test/termico_test.py`](../../test/termico_test.py) (due minuti e
+mezzo; una GPU finta che risponde come `nvidia-smi`, un motore finto, e il programma lanciato davvero): calcolo di
 fasce, giudizi, pendenze e riepiloghi; lettura e scrittura del CSV (anche con righe troncate); `stato` con tutti i
 codici di uscita; `osserva` con file di stato letto in continuazione senza mai trovarlo a metà; `riepilogo` di una
 prova interrotta con un segnale di terminazione; la sessione guidata pilotata come da una persona (compreso l'Invio
 premuto per sbaglio durante una fase automatica); `confronta`; motore spento, motore che si spegne a metà, chiave API
-giusta e sbagliata, GPU che risponde a intermittenza o per niente; la chiave non compare mai nell'uscita né nei file.
-Inoltre `termico.py` e `carico_motore.py` sono stati provati contro un vero `sd-server` (build per CPU, modello
+giusta e sbagliata, GPU che risponde a intermittenza o per niente; la chiave non compare mai nell'uscita né nei file;
+`osserva --segnala` con motori finti a tre, due e un livello di sforzo, e contro un vero `sd-server` in
+[`test/server_guardian_e2e.py`](../../test/server_guardian_e2e.py), anche con `--device-health levels=2`. Inoltre
+`termico.py` e `carico_motore.py` sono stati provati contro un vero `sd-server` (build per CPU, modello
 sintetico, GPU simulata) mentre generava, con uno script di prova che non fa parte del repository: sei job completati
 e uno fermato con `cancel`, i contatori letti da `termico.py` uguali a quelli di `/health`, nessuna discesa di
 profilo. Per vedere che i controlli servano a qualcosa, durante lo sviluppo sono stati inseriti di proposito 42 errori
@@ -630,6 +675,7 @@ della prima versione funzionano ancora).
 | `--auto-secondi S` | guidata | Durata delle fasi automatiche (default 120). |
 | `--durata S` | osserva | Secondi da registrare (default: fino a Ctrl+C). |
 | `--file-stato FILE` | osserva | File JSON con l'ultima lettura, riscritto a ogni campione. |
+| `--segnala [DEVICE]` | osserva | Manda al motore (serve `--motore`) la fascia della GPU come livello di salute del device; senza `DEVICE` lo cerca dal nome della GPU (sezione 7.1). |
 | `--json FILE` | riepilogo, confronta | Scrive anche il risultato in JSON. |
 
 `carico_motore.py`: `--url` (default `http://127.0.0.1:1234`), `--chiave-api`, `--durata` (default 180),
