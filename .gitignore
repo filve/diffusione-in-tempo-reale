@@ -23,6 +23,8 @@ test/*
 !test/termico_test.py
 !test/agenti_guardiano_test.py
 !test/fuzz_model_loader.py
+!test/make_sd15_synth.py
+!test/run_unit_tests.sh
 tests/
 /dgl/*
 !/dgl/.gitkeep
