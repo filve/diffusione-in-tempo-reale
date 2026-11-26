@@ -23,7 +23,28 @@ G=${G:-$PWD/ggml/include}
 [ -f "$G/ggml.h" ] || { echo "no ggml headers in $G" >&2; exit 2; }
 [ -f "$B/libstable-diffusion.a" ] || { echo "no libstable-diffusion.a in $B: build the library first" >&2; exit 2; }
 
-LIBS="$B/libstable-diffusion.a $B/ggml/src/libggml.a $B/ggml/src/libggml-cpu.a $B/ggml/src/libggml-base.a -ldl -lm -fopenmp -pthread"
+# The programs need the libraries CMake links into sd-cli, and those depend on the options of the build (WebP and
+# WebM when their submodules are there, OpenMP...), so they are read from the build files.
+cmake_link_libs() {
+    local base libs="" item out=""
+    if [ -f "$B/build.ninja" ]; then
+        base=$B
+        libs=$(awk '/^build bin\/sd-cli:/ { found = 1 } found && /^  LINK_LIBRARIES = / { sub(/^  LINK_LIBRARIES = /, ""); print; exit }' "$B/build.ninja")
+    elif [ -f "$B/examples/cli/CMakeFiles/sd-cli.dir/link.txt" ]; then
+        base=$B/examples/cli
+        libs=$(sed -e 's/^.* -o [^ ]*sd-cli //' "$base/CMakeFiles/sd-cli.dir/link.txt")
+    fi
+    [ -n "$libs" ] || return 1
+    for item in $libs; do
+        case $item in
+            -* | /*) out="$out $item" ;;
+            *) out="$out $base/$item" ;;
+        esac
+    done
+    echo "$out -pthread"
+}
+LIBS=$(cmake_link_libs) || LIBS="$B/libstable-diffusion.a $B/ggml/src/libggml.a $B/ggml/src/libggml-cpu.a $B/ggml/src/libggml-base.a -ldl -lm -fopenmp -pthread"
+echo "linking with:$LIBS"
 FL="-std=c++17 -O1 -DGGML_MAX_NAME=160 -Isrc -Isrc/core -Iinclude -Ithirdparty -I$G"
 EX="examples/common/common.cpp examples/common/log.cpp examples/common/media_io.cpp examples/common/media_metadata.cpp examples/common/profile.cpp $T/zip.o"
 cc -c thirdparty/zip.c -o "$T/zip.o" >"$T/zip.compile.log" 2>&1 || { echo "thirdparty/zip.c does not build, see $T/zip.compile.log" >&2; exit 1; }
