@@ -1,0 +1,100 @@
+name: Fork tests
+
+# The fork's own tests on a CPU build: the unit-test programs of test/ and the runs of a real sd-server with a
+# synthetic SD 1.5 model. leejet's build.yml only builds and packages; this file exists only in the fork, so a
+# sync with upstream never touches it.
+
+on:
+  workflow_dispatch: # allows manual triggering
+  push:
+    branches:
+      - master
+      - fix_to_claude
+      - fork-pull
+    paths:
+      [
+        ".github/workflows/fork-tests.yml",
+        "**/CMakeLists.txt",
+        "**/*.h",
+        "**/*.hpp",
+        "**/*.c",
+        "**/*.cpp",
+        "ggml",
+        "test/**",
+        "scripts/diagnostica_termica/**",
+        "docs/agenti_indipendenti.md",
+      ]
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      [
+        ".github/workflows/fork-tests.yml",
+        "**/CMakeLists.txt",
+        "**/*.h",
+        "**/*.hpp",
+        "**/*.c",
+        "**/*.cpp",
+        "ggml",
+        "test/**",
+        "scripts/diagnostica_termica/**",
+        "docs/agenti_indipendenti.md",
+      ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  linux-cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ninja-build python3-numpy
+
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSD_BUILD_EXAMPLES=ON -DSD_SERVER_BUILD_FRONTEND=OFF
+          cmake --build build --target sd-cli sd-server
+
+      - name: Unit-test programs
+        run: bash test/run_unit_tests.sh build
+
+      - name: Synthetic SD 1.5 model
+        run: python3 test/make_sd15_synth.py "$RUNNER_TEMP/models/sd15_synth.safetensors"
+
+      - name: Stopping jobs on sd-server
+        run: python3 test/server_cancel_e2e.py --server build/bin/sd-server --model "$RUNNER_TEMP/models/sd15_synth.safetensors"
+
+      - name: Guardian of sd-server
+        run: python3 test/server_guardian_e2e.py --server build/bin/sd-server --model "$RUNNER_TEMP/models/sd15_synth.safetensors"
+
+      - name: Guardian example for independent agents
+        run: python3 test/agenti_guardiano_test.py --server build/bin/sd-server --model "$RUNNER_TEMP/models/sd15_synth.safetensors"
+
+      - name: termico.py
+        run: python3 test/termico_test.py
+
+      - name: Hostile models and options
+        run: bash test/security_smoke.sh build/bin/sd-cli
+
+      - name: Logs of the failed tests
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: fork-tests-logs
+          path: |
+            build/unit-tests/*.log
+            /tmp/sd-server-*.log
+          if-no-files-found: ignore

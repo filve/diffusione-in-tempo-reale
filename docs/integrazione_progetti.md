@@ -2101,6 +2101,26 @@ sincronizzazioni future.
     66 senza server e 91 con il server vero; `security_smoke.sh`;
     `dgl-check-builtins`; la prova d'integrazione del registro nel motore (12
     controlli, non nel repository). **Non provato**: GPU vere, Windows.
+28. **I test del fork nella CI** — fino a qui la CI compilava soltanto: i
+    programmi di `test/` e le prove con un vero `sd-server` giravano solo a
+    mano, e così `test/agenti_guardiano_test.py` è rimasto rotto su
+    `fork-pull` dalla sincronizzazione 4 senza che nessuno se ne accorgesse.
+    Il workflow nuovo `.github/workflows/fork-tests.yml`, che esiste solo nel
+    fork, a ogni pull request e a ogni push su `master`, `fix_to_claude` e
+    `fork-pull` compila su Linux una build per CPU e fa girare i dodici
+    programmi con `test/run_unit_tests.sh`. Poi crea il modello SD 1.5
+    sintetico con `test/make_sd15_synth.py` e con quello fa girare
+    `test/server_cancel_e2e.py`, `test/server_guardian_e2e.py` e
+    `test/agenti_guardiano_test.py`, e infine `test/termico_test.py` e
+    `test/security_smoke.sh`. Quando qualcosa fallisce, i log dei test si
+    scaricano dalla pagina della CI. Lo script crea, byte per byte, lo stesso
+    modello usato in tutte le prove di questa guida.
+
+    Provato qui: `run_unit_tests.sh` fa passare i dodici programmi ed esce
+    con `1` quando un programma non compila (sette su dodici, con la libreria
+    di `fork-pull` di prima, che non aveva la salute dei device), con `2`
+    quando manca la build; `actionlint` non trova errori nel workflow. La
+    prima esecuzione sui runner di GitHub arriva con il push.
 
 Passaggi previsti e non ancora svolti: collaudo del workflow di release sui
 runner GitHub, prova di `--multi-gpu` su una macchina con due GPU, generazione
