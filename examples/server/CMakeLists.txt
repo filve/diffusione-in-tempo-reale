@@ -72,6 +72,7 @@ add_executable(${TARGET}
     server_access.cpp
     runtime.cpp
     recovery.cpp
+    guardian.cpp
     model_catalog.cpp
     routes_models.cpp
     async_jobs.cpp

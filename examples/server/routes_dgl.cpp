@@ -6,6 +6,7 @@
 #include <string_view>
 
 #include "async_jobs.h"
+#include "guardian.h"
 
 namespace {
     namespace fs   = std::filesystem;
@@ -160,6 +161,9 @@ void register_dgl_endpoints(httplib::Server& svr, ServerRuntime& runtime) {
              }));
 
     svr.Post("/sdcpp/v1/dgl/jobs", with_dgl_errors([&runtime](const Request& req, Response& res) {
+                 if (refuse_while_halted(runtime.guardian, res)) {
+                     return;
+                 }
                  auto source = json::parse(req.body).at("source").get<std::string>();
                  if (source.empty() || !valid_source(source)) {
                      send_error(res, 400, "Expected non-empty UTF-8 source");

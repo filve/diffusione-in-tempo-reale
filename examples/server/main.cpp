@@ -13,6 +13,7 @@
 #include "common/common.h"
 #include "common/profile.h"
 #include "common/resource_owners.hpp"
+#include "guardian.h"
 #include "model_catalog.h"
 #include "recovery.h"
 #include "routes.h"
@@ -96,6 +97,9 @@ int main(int argc, const char** argv) {
     LOG_DEBUG("%s", ctx_params.to_string().c_str());
     LOG_DEBUG("%s", default_gen_params.to_string().c_str());
 
+    if (!ctx_params.apply_device_health_option()) {
+        return 1;
+    }
     if (!ctx_params.register_rpc_devices()) {
         return 1;
     }
@@ -110,10 +114,18 @@ int main(int argc, const char** argv) {
         return 1;
     }
 
+    Guardian guardian(svr_params.guardian);
+    if (svr_params.guardian) {
+        LOG_INFO("the guardian stops all work when a component is reported critical or device health excludes every GPU and the CPU (--guardian off to disable)");
+    } else {
+        LOG_INFO("the guardian is off: the server never stops all work by itself (device health still moves work between devices)");
+    }
+
     ContextKeeper::Settings keeper_settings;
     keeper_settings.degradation      = !svr_params.disable_degradation;
     keeper_settings.cooldown_seconds = svr_params.degradation_cooldown;
     ContextKeeper::Hooks keeper_hooks;
+    keeper_hooks.halted = [&guardian] { return guardian.evaluate().halted; };
     // Every context the keeper creates, after a step down too, reads files only where the server allows it, and
     // its DGL jobs show their progress on the console as well as in the job.
     keeper_hooks.create_context = [&models](const SDContextParams& params, GenerationFailure& failure) {
@@ -196,6 +208,7 @@ int main(int argc, const char** argv) {
         &async_job_manager,
         &models,
     };
+    runtime.guardian = &guardian;
 
     try {
         initialize_server_models(runtime);
@@ -205,6 +218,7 @@ int main(int argc, const char** argv) {
     }
 
     std::thread async_worker(async_job_worker, std::ref(runtime));
+    guardian.watch([&runtime](const Guardian::State& state) { stop_work_for_guardian(runtime, state.reason); });
 
     SDHttpServer svr(svr_params);
 
@@ -243,5 +257,7 @@ int main(int argc, const char** argv) {
     }
     async_job_manager.cv.notify_all();
     async_worker.join();
+    // The guardian outlives the runtime its watcher stops the work of.
+    guardian.stop_watching();
     return exit_code;
 }

@@ -18,6 +18,7 @@ struct ArgOptions;
 struct SDContextParams;
 struct AsyncJobManager;
 class ContextKeeper;
+class Guardian;
 struct ServerModels;
 
 struct SDSvrParams {
@@ -30,6 +31,7 @@ struct SDSvrParams {
     std::string serve_html_path;
     bool disable_degradation = false;
     int degradation_cooldown = 300;  // seconds before the server tries a heavier profile again; 0 = never
+    bool guardian            = true;  // stop all work when device health leaves nothing to run on (--guardian)
     std::string dgl_dir = "dgl";
     bool media_view = true;
     std::vector<std::string> model_dirs;
@@ -81,6 +83,7 @@ struct ServerRuntime {
     std::mutex* upscaler_mutex;
     AsyncJobManager* async_job_manager;
     ServerModels* models;
+    Guardian* guardian = nullptr;
 };
 
 struct ServerADetailerPass {
